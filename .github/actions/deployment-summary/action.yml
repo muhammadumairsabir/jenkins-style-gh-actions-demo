@@ -1,0 +1,40 @@
+name: Jenkins-style deployment summary
+description: Lists pull requests and direct commits since the previous successful deployment.
+
+inputs:
+  title:
+    description: Job summary title
+    required: false
+    default: Deployment summary
+  environment:
+    description: Deployment environment whose successful baseline should be used
+    required: true
+  target-branch:
+    description: Branch that was checked out and deployed
+    required: true
+  deployment-succeeded:
+    description: Set to true only when the deployment step succeeded
+    required: true
+  include-changed-files:
+    description: Include the net changed-file list for the deployment range
+    required: false
+    default: "true"
+  max-changed-files:
+    description: Maximum changed files rendered in the summary
+    required: false
+    default: "100"
+
+runs:
+  using: composite
+  steps:
+    - name: Generate deployment changelog and update successful baseline
+      shell: bash
+      env:
+        INPUT_TITLE: ${{ inputs.title }}
+        INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        INPUT_TARGET_BRANCH: ${{ inputs.target-branch }}
+        INPUT_DEPLOYMENT_SUCCEEDED: ${{ inputs.deployment-succeeded }}
+        INPUT_INCLUDE_CHANGED_FILES: ${{ inputs.include-changed-files }}
+        INPUT_MAX_CHANGED_FILES: ${{ inputs.max-changed-files }}
+        GH_TOKEN: ${{ github.token }}
+      run: "$GITHUB_ACTION_PATH/run.sh"
