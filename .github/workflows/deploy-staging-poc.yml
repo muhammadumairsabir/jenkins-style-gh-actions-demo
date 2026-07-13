@@ -1,0 +1,129 @@
+name: POC Deploy to Staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_result:
+        description: Simulated deployment outcome
+        required: true
+        default: success
+        type: choice
+        options:
+          - success
+          - failure
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: poc-deploy-staging
+  cancel-in-progress: false
+
+env:
+  REPORT_DIR: deploy-reports
+  TARGET_ENV: staging
+  TARGET_BRANCH: staging
+
+jobs:
+  deploy:
+    name: POC Deploy to Staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout POC automation
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 1
+          path: automation
+
+      - name: Prepare report files
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          echo "unknown" > "$REPORT_DIR/deploy-status.txt"
+          echo "not-required-in-poc" > "$REPORT_DIR/ssh-agent-status.txt"
+          echo "unknown" > "$REPORT_DIR/changed-files-status.txt"
+          : > "$REPORT_DIR/deploy.log"
+
+      - name: Verify target branch exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git -C automation ls-remote --exit-code --heads origin "refs/heads/$TARGET_BRANCH" >/dev/null; then
+            echo "::error::Remote branch '$TARGET_BRANCH' does not exist. Push it to origin before running this POC."
+            echo "failed" > "$REPORT_DIR/deploy-status.txt"
+            echo "Remote branch '$TARGET_BRANCH' was not found." >> "$REPORT_DIR/deploy.log"
+            exit 1
+          fi
+
+      - name: Checkout target branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          path: source
+
+      - name: Verify target checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C source rev-parse --is-inside-work-tree
+          git -C source rev-parse --verify HEAD
+          git -C source status --short --branch
+
+      - name: Simulate deployment
+        id: deploy_staging
+        continue-on-error: true
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+
+          DEPLOYED_SHA="$(git rev-parse HEAD)"
+          echo "$DEPLOYED_SHA" > "$GITHUB_WORKSPACE/$REPORT_DIR/deployed-sha.txt"
+
+          {
+            echo "Environment: $TARGET_ENV"
+            echo "Branch: $TARGET_BRANCH"
+            echo "Deployed SHA: $DEPLOYED_SHA"
+          } | tee "$GITHUB_WORKSPACE/$REPORT_DIR/deploy.log"
+
+          if [[ "${{ inputs.deployment_result }}" == "failure" ]]; then
+            echo "Simulated deployment failure." | tee -a "$GITHUB_WORKSPACE/$REPORT_DIR/deploy.log"
+            echo "failed" > "$GITHUB_WORKSPACE/$REPORT_DIR/deploy-status.txt"
+            exit 42
+          fi
+
+          echo "Simulated deployment completed successfully." | tee -a "$GITHUB_WORKSPACE/$REPORT_DIR/deploy.log"
+          echo "success" > "$GITHUB_WORKSPACE/$REPORT_DIR/deploy-status.txt"
+
+      - name: Generate job summary
+        if: always()
+        uses: ./automation/.github/actions/job-summary
+        with:
+          title: Staging Deployment Summary POC
+          environment: staging
+          target-branch: staging
+          repository-path: source
+          github-token: ${{ github.token }}
+          report-dir: deploy-reports
+          state-prefix: poc-deployment-state
+          include-changed-files: "true"
+          include-deploy-log: "true"
+
+      - name: Fail workflow if deployment failed
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEPLOY_STATUS="$(cat "$REPORT_DIR/deploy-status.txt" 2>/dev/null || echo failed)"
+
+          if [[ "$DEPLOY_STATUS" != "success" ]]; then
+            echo "::error::POC staging deployment failed. See the job summary."
+            exit 1
+          fi
