@@ -1,0 +1,87 @@
+name: Demo - Jenkins-style deployment changelog
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: Branch to deploy and inspect
+        required: true
+        type: string
+        default: release/demo
+      environment:
+        description: Independent deployment baseline
+        required: true
+        type: choice
+        options:
+          - demo
+          - test
+          - production
+        default: demo
+      deployment_result:
+        description: Simulate a successful or failed deployment
+        required: true
+        type: choice
+        options:
+          - success
+          - failure
+        default: success
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.target_branch }} to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: deployment-${{ inputs.environment }}-${{ inputs.target_branch }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout target branch with complete history
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+
+      - name: Verify checked-out revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Branch input: ${{ inputs.target_branch }}"
+          echo "Checked-out SHA: $(git rev-parse HEAD)"
+          git log -1 --oneline --decorate
+
+      - name: Simulate deployment
+        id: deployment
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ inputs.deployment_result }}" == "failure" ]]; then
+            echo "Simulating a failed deployment."
+            exit 42
+          fi
+
+          echo "Simulating a successful deployment of $(git rev-parse --short HEAD)."
+
+      - name: Generate Jenkins-style summary
+        if: always()
+        uses: ./.github/actions/deployment-summary
+        with:
+          title: Demo deployment summary
+          environment: ${{ inputs.environment }}
+          target-branch: ${{ inputs.target_branch }}
+          deployment-succeeded: ${{ steps.deployment.outcome == 'success' }}
+          include-changed-files: "true"
+          max-changed-files: "100"
+
+      - name: Preserve the simulated deployment result
+        if: ${{ steps.deployment.outcome != 'success' }}
+        shell: bash
+        run: |
+          echo "Deployment failed; failing the job after generating the summary."
+          exit 1
