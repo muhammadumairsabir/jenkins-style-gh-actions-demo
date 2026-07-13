@@ -1,0 +1,496 @@
+name: Main Deployment Summary
+run-name: Main deployment summary at ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_result:
+        description: Simulated deployment result for testing
+        required: true
+        default: success
+        type: choice
+        options:
+          - success
+          - failure
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: main-deployment-summary
+  cancel-in-progress: false
+
+jobs:
+  deploy-main:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Require dispatch from main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF_NAME" != "main" ]]; then
+            echo "This workflow must be dispatched from the main branch." >&2
+            echo "Selected branch: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+      - name: Checkout complete main history
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Find previous successful main deployment
+        id: baseline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          WORKFLOW_ID="$({
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              --jq '.workflow_id'
+          })"
+
+          PREVIOUS_RUN="$({
+            gh api \
+              --method GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_ID}/runs" \
+              -f branch=main \
+              -f status=success \
+              -f per_page=100 \
+              --jq '
+                if (.workflow_runs | length) == 0 then
+                  ""
+                else
+                  .workflow_runs[0]
+                  | [.id, .head_sha, .html_url, .run_number]
+                  | @tsv
+                end
+              '
+          })"
+
+          PREVIOUS_RUN_ID=""
+          PREVIOUS_SHA=""
+          PREVIOUS_RUN_URL=""
+          PREVIOUS_RUN_NUMBER=""
+
+          if [[ -n "$PREVIOUS_RUN" ]]; then
+            IFS=$'\t' read -r \
+              PREVIOUS_RUN_ID \
+              PREVIOUS_SHA \
+              PREVIOUS_RUN_URL \
+              PREVIOUS_RUN_NUMBER \
+              <<< "$PREVIOUS_RUN"
+          fi
+
+          {
+            echo "workflow-id=$WORKFLOW_ID"
+            echo "previous-run-id=$PREVIOUS_RUN_ID"
+            echo "previous-sha=$PREVIOUS_SHA"
+            echo "previous-run-url=$PREVIOUS_RUN_URL"
+            echo "previous-run-number=$PREVIOUS_RUN_NUMBER"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ -z "$PREVIOUS_SHA" ]]; then
+            echo "No previous successful run exists. This run will establish the baseline."
+          else
+            echo "Previous successful SHA: $PREVIOUS_SHA"
+          fi
+
+      - name: Build Jenkins-style change report
+        id: report
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ steps.baseline.outputs.previous-sha }}
+          TARGET_BRANCH: main
+        run: |
+          set -euo pipefail
+
+          REPORT_DIR="${RUNNER_TEMP}/main-deployment-report"
+          mkdir -p "$REPORT_DIR"
+
+          PR_FILE="$REPORT_DIR/main-prs.tsv"
+          DIRECT_FILE="$REPORT_DIR/direct-commits.tsv"
+          CHANGED_FILE="$REPORT_DIR/changed-files.tsv"
+          META_FILE="$REPORT_DIR/meta.env"
+
+          : > "$PR_FILE"
+          : > "$DIRECT_FILE"
+          : > "$CHANGED_FILE"
+
+          CURRENT_SHA="$(git rev-parse HEAD)"
+
+          sanitize_tsv() {
+            printf '%s' "$1" | tr '\t\r\n' '   '
+          }
+
+          if [[ -z "$BASE_SHA" ]]; then
+            {
+              echo "REPORT_STATUS=first_run"
+              echo "BASE_SHA="
+              echo "CURRENT_SHA=$CURRENT_SHA"
+              echo "COMMIT_COUNT=0"
+              echo "PR_COUNT=0"
+              echo "DIRECT_COUNT=0"
+              echo "TOTAL=0"
+              echo "ADDED=0"
+              echo "MODIFIED=0"
+              echo "DELETED=0"
+              echo "RENAMED=0"
+              echo "COPIED=0"
+            } > "$META_FILE"
+
+            echo "report-dir=$REPORT_DIR" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$BASE_SHA"
+          fi
+
+          if ! git merge-base --is-ancestor "$BASE_SHA" "$CURRENT_SHA"; then
+            {
+              echo "REPORT_STATUS=baseline_not_ancestor"
+              echo "BASE_SHA=$BASE_SHA"
+              echo "CURRENT_SHA=$CURRENT_SHA"
+              echo "COMMIT_COUNT=0"
+              echo "PR_COUNT=0"
+              echo "DIRECT_COUNT=0"
+              echo "TOTAL=0"
+              echo "ADDED=0"
+              echo "MODIFIED=0"
+              echo "DELETED=0"
+              echo "RENAMED=0"
+              echo "COPIED=0"
+            } > "$META_FILE"
+
+            echo "report-dir=$REPORT_DIR" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RANGE="${BASE_SHA}..${CURRENT_SHA}"
+
+          git diff \
+            --name-status \
+            --find-renames \
+            --find-copies \
+            "$BASE_SHA" "$CURRENT_SHA" > "$CHANGED_FILE"
+
+          TOTAL="$(awk 'NF {n++} END {print n+0}' "$CHANGED_FILE")"
+          ADDED="$(awk -F '\t' '$1 == "A" {n++} END {print n+0}' "$CHANGED_FILE")"
+          MODIFIED="$(awk -F '\t' '$1 == "M" {n++} END {print n+0}' "$CHANGED_FILE")"
+          DELETED="$(awk -F '\t' '$1 == "D" {n++} END {print n+0}' "$CHANGED_FILE")"
+          RENAMED="$(awk -F '\t' '$1 ~ /^R/ {n++} END {print n+0}' "$CHANGED_FILE")"
+          COPIED="$(awk -F '\t' '$1 ~ /^C/ {n++} END {print n+0}' "$CHANGED_FILE")"
+
+          mapfile -t FIRST_PARENT_COMMITS < <(
+            git rev-list --first-parent --reverse "$RANGE"
+          )
+
+          declare -A SEEN_PRS=()
+
+          for COMMIT_SHA in "${FIRST_PARENT_COMMITS[@]}"; do
+            MAIN_PRS="$({
+              gh api \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}/pulls?per_page=100" \
+                --jq '
+                  .[]
+                  | select(.merged_at != null)
+                  | select(.base.ref == "main")
+                  | [
+                      (.number | tostring),
+                      (.title | gsub("[\\t\\r\\n]"; " ")),
+                      .html_url,
+                      (.user.login // "unknown"),
+                      .merged_at,
+                      .merge_commit_sha
+                    ]
+                  | @tsv
+                '
+            })"
+
+            HAS_MAIN_PR=false
+
+            while IFS=$'\t' read -r \
+              PR_NUMBER \
+              PR_TITLE \
+              PR_URL \
+              PR_AUTHOR \
+              PR_MERGED_AT \
+              PR_MERGE_SHA
+            do
+              [[ -z "${PR_NUMBER:-}" ]] && continue
+              HAS_MAIN_PR=true
+
+              if [[ -z "${SEEN_PRS[$PR_NUMBER]+present}" ]]; then
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                  "$PR_NUMBER" \
+                  "$(sanitize_tsv "$PR_TITLE")" \
+                  "$PR_URL" \
+                  "$PR_AUTHOR" \
+                  "$PR_MERGED_AT" \
+                  "$PR_MERGE_SHA" \
+                  >> "$PR_FILE"
+
+                SEEN_PRS["$PR_NUMBER"]=1
+              fi
+            done <<< "$MAIN_PRS"
+
+            if [[ "$HAS_MAIN_PR" == "false" ]]; then
+              SHORT_SHA="$(git rev-parse --short=7 "$COMMIT_SHA")"
+              SUBJECT="$(git show -s --format='%s' "$COMMIT_SHA")"
+              AUTHOR="$(git show -s --format='%an' "$COMMIT_SHA")"
+              COMMIT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${COMMIT_SHA}"
+
+              printf '%s\t%s\t%s\t%s\n' \
+                "$SHORT_SHA" \
+                "$(sanitize_tsv "$SUBJECT")" \
+                "$(sanitize_tsv "$AUTHOR")" \
+                "$COMMIT_URL" \
+                >> "$DIRECT_FILE"
+            fi
+          done
+
+          COMMIT_COUNT="${#FIRST_PARENT_COMMITS[@]}"
+          PR_COUNT="$(awk 'NF {n++} END {print n+0}' "$PR_FILE")"
+          DIRECT_COUNT="$(awk 'NF {n++} END {print n+0}' "$DIRECT_FILE")"
+
+          {
+            echo "REPORT_STATUS=success"
+            echo "BASE_SHA=$BASE_SHA"
+            echo "CURRENT_SHA=$CURRENT_SHA"
+            echo "COMMIT_COUNT=$COMMIT_COUNT"
+            echo "PR_COUNT=$PR_COUNT"
+            echo "DIRECT_COUNT=$DIRECT_COUNT"
+            echo "TOTAL=$TOTAL"
+            echo "ADDED=$ADDED"
+            echo "MODIFIED=$MODIFIED"
+            echo "DELETED=$DELETED"
+            echo "RENAMED=$RENAMED"
+            echo "COPIED=$COPIED"
+          } > "$META_FILE"
+
+          echo "report-dir=$REPORT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Simulate deployment
+        id: deployment
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Deploying main at $(git rev-parse --short=7 HEAD)"
+
+          if [[ "${{ inputs.deployment_result }}" == "failure" ]]; then
+            echo "The deployment was intentionally failed for the test scenario." >&2
+            exit 42
+          fi
+
+          echo "Deployment completed successfully."
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        env:
+          REPORT_DIR: ${{ steps.report.outputs.report-dir }}
+          PREVIOUS_RUN_URL: ${{ steps.baseline.outputs.previous-run-url }}
+          PREVIOUS_RUN_NUMBER: ${{ steps.baseline.outputs.previous-run-number }}
+          DEPLOYMENT_OUTCOME: ${{ steps.deployment.outcome }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${REPORT_DIR:-}" || ! -f "$REPORT_DIR/meta.env" ]]; then
+            {
+              echo "# Main Deployment Summary"
+              echo ""
+              echo "> [!CAUTION]"
+              echo "> The change report could not be generated. Inspect the preceding workflow steps."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # shellcheck disable=SC1090
+          source "$REPORT_DIR/meta.env"
+
+          CURRENT_RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          CURRENT_COMMIT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${CURRENT_SHA}"
+
+          {
+            echo "# Main Deployment Summary"
+            echo ""
+            echo "## Deployment"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Branch | \`main\` |"
+            echo "| Current commit | [\`${CURRENT_SHA:0:7}\`](${CURRENT_COMMIT_URL}) |"
+            echo "| Current run | [#${GITHUB_RUN_NUMBER}](${CURRENT_RUN_URL}) |"
+            echo "| Deployment outcome | \`${DEPLOYMENT_OUTCOME}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$REPORT_STATUS" == "first_run" ]]; then
+            {
+              echo ""
+              echo "## Changes Since Previous Successful Deployment"
+              echo ""
+              echo "> [!NOTE]"
+              echo "> No previous successful main deployment exists. This successful run establishes the baseline for the next deployment."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          BASE_COMMIT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${BASE_SHA}"
+          COMPARE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${BASE_SHA}...${CURRENT_SHA}"
+
+          if [[ "$REPORT_STATUS" == "baseline_not_ancestor" ]]; then
+            {
+              echo ""
+              echo "## Changes Since Previous Successful Deployment"
+              echo ""
+              echo "> [!WARNING]"
+              echo "> The previous successful SHA is not an ancestor of the current main SHA. The branch may have been force-pushed or rewritten."
+              echo ""
+              echo "| Revision | Commit |"
+              echo "|---|---|"
+              echo "| Previous successful run | [\`${BASE_SHA:0:7}\`](${BASE_COMMIT_URL}) |"
+              echo "| Current run | [\`${CURRENT_SHA:0:7}\`](${CURRENT_COMMIT_URL}) |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo ""
+            echo "## Changes Since Previous Successful Deployment"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            if [[ -n "${PREVIOUS_RUN_URL:-}" ]]; then
+              echo "| Previous successful run | [#${PREVIOUS_RUN_NUMBER}](${PREVIOUS_RUN_URL}) |"
+            fi
+            echo "| Previous commit | [\`${BASE_SHA:0:7}\`](${BASE_COMMIT_URL}) |"
+            echo "| Comparison | [\`${BASE_SHA:0:7}...${CURRENT_SHA:0:7}\`](${COMPARE_URL}) |"
+            echo "| First-parent commits | ${COMMIT_COUNT} |"
+            echo "| PRs merged into main | **${PR_COUNT}** |"
+            echo "| Direct commits | ${DIRECT_COUNT} |"
+            echo "| Net changed files | ${TOTAL} |"
+            echo ""
+            echo "### Pull Requests Merged into Main"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ! -s "$REPORT_DIR/main-prs.tsv" ]]; then
+            echo "No pull requests were merged into \`main\` in this deployment range." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "| PR | Title | Author | Merged at |"
+              echo "|---:|---|---|---|"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            while IFS=$'\t' read -r \
+              PR_NUMBER \
+              PR_TITLE \
+              PR_URL \
+              PR_AUTHOR \
+              PR_MERGED_AT \
+              PR_MERGE_SHA
+            do
+              [[ -z "${PR_NUMBER:-}" ]] && continue
+              PR_TITLE="${PR_TITLE//|/\\|}"
+
+              echo "| [#${PR_NUMBER}](${PR_URL}) | ${PR_TITLE} | @${PR_AUTHOR} | \`${PR_MERGED_AT}\` |" \
+                >> "$GITHUB_STEP_SUMMARY"
+            done < "$REPORT_DIR/main-prs.tsv"
+          fi
+
+          if [[ -s "$REPORT_DIR/direct-commits.tsv" ]]; then
+            {
+              echo ""
+              echo "### Direct Commits to Main"
+              echo ""
+              echo "| Commit | Subject | Author |"
+              echo "|---|---|---|"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            while IFS=$'\t' read -r \
+              COMMIT_SHORT_SHA \
+              COMMIT_SUBJECT \
+              COMMIT_AUTHOR \
+              COMMIT_URL
+            do
+              [[ -z "${COMMIT_SHORT_SHA:-}" ]] && continue
+              COMMIT_SUBJECT="${COMMIT_SUBJECT//|/\\|}"
+
+              echo "| [\`${COMMIT_SHORT_SHA}\`](${COMMIT_URL}) | ${COMMIT_SUBJECT} | ${COMMIT_AUTHOR} |" \
+                >> "$GITHUB_STEP_SUMMARY"
+            done < "$REPORT_DIR/direct-commits.tsv"
+          fi
+
+          {
+            echo ""
+            echo "### Changed Files"
+            echo ""
+            echo "| Type | Count |"
+            echo "|---|---:|"
+            echo "| Added | ${ADDED} |"
+            echo "| Modified | ${MODIFIED} |"
+            echo "| Deleted | ${DELETED} |"
+            echo "| Renamed | ${RENAMED} |"
+            echo "| Copied | ${COPIED} |"
+            echo "| Total | **${TOTAL}** |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ! -s "$REPORT_DIR/changed-files.tsv" ]]; then
+            echo "No net file changes exist between the two successful deployment revisions." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "| Status | File |"
+              echo "|---|---|"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            DISPLAYED=0
+            while IFS=$'\t' read -r STATUS FILE EXTRA; do
+              [[ -z "${STATUS:-}" || -z "${FILE:-}" ]] && continue
+
+              FILE="${FILE//|/\\|}"
+              EXTRA="${EXTRA//|/\\|}"
+
+              if [[ "$STATUS" == R* || "$STATUS" == C* ]]; then
+                echo "| \`${STATUS}\` | \`${FILE}\` → \`${EXTRA}\` |" \
+                  >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "| \`${STATUS}\` | \`${FILE}\` |" \
+                  >> "$GITHUB_STEP_SUMMARY"
+              fi
+
+              DISPLAYED=$((DISPLAYED + 1))
+              if (( DISPLAYED >= 100 )); then
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "Only the first 100 changed files are displayed." >> "$GITHUB_STEP_SUMMARY"
+                break
+              fi
+            done < "$REPORT_DIR/changed-files.tsv"
+          fi
+
+      - name: Mark simulated deployment as failed
+        if: steps.deployment.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "Failing the workflow because the simulated deployment failed." >&2
+          exit 1
