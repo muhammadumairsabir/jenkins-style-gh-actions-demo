@@ -173,4 +173,4 @@ The same PR must appear again. This confirms that the comparison starts at the p
 
 ## Important behavior
 
-Do not add a normal `push` trigger to this test workflow when testing the five-PR batch. A push workflow would run after every separate PR merge into `main`, so each successful run would normally advance the baseline and report only the newly merged PR.
+Do not add a normal `push` trigger to this test workflow when testing the five-PR batch. A push workflow would run after every separate PR merge into `main`, so each successful run would normally advance the baseline and report only the newly merged PR. Just for testing
